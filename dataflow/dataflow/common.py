@@ -102,6 +102,16 @@ class BatchData(ProxyDataFlow):
         assert self.batch_size > 0
         self.remainder = remainder
         self.use_list = use_list
+        self._guard = DataFlowReentrantGuard()
+        self._itr = None
+        # Datapoints that were taken from `ds` but not yet produced as a batch.
+        self._holder = []
+
+    def reset_state(self):
+        super(BatchData, self).reset_state()
+        self._guard = DataFlowReentrantGuard()
+        self._itr = None
+        self._holder = []
 
     def __len__(self):
         ds_size = len(self.ds)
@@ -116,14 +126,58 @@ class BatchData(ProxyDataFlow):
         Yields:
             Batched data by stacking each component on an extra 0th dimension.
         """
-        holder = []
-        for data in self.ds:
-            holder.append(data)
-            if len(holder) == self.batch_size:
-                yield BatchData.aggregate_batch(holder, self.use_list)
-                del holder[:]
-        if self.remainder and len(holder) > 0:
-            yield BatchData.aggregate_batch(holder, self.use_list)
+        with self._guard:
+            if self._itr is None:
+                self._itr = iter(self.ds)
+            for data in self._itr:
+                self._holder.append(data)
+                if len(self._holder) == self.batch_size:
+                    batch = BatchData.aggregate_batch(self._holder, self.use_list)
+                    # clear the holder before yielding, so that the state of
+                    # this dataflow is well-defined whenever it is paused
+                    del self._holder[:]
+                    yield batch
+            if self.remainder and len(self._holder) > 0:
+                batch = BatchData.aggregate_batch(self._holder, self.use_list)
+                del self._holder[:]
+                yield batch
+            # The underlying dataflow is exhausted: drop the incomplete batch
+            # (if any) and start a new pass over it in the next call.
+            del self._holder[:]
+            self._itr = None
+
+    def get_state(self):
+        return {
+            'class': type(self).__name__,
+            'config': {
+                'batch_size': self.batch_size,
+                'remainder': self.remainder,
+                'use_list': self.use_list,
+            },
+            'state': {'holder': list(self._holder)},
+            'child': self.ds.get_state(),
+        }
+
+    def set_state(self, state):
+        self._check_state(state, {
+            'batch_size': self.batch_size,
+            'remainder': self.remainder,
+            'use_list': self.use_list,
+        })
+        holder = state['state']['holder']
+        if len(holder) >= self.batch_size:
+            raise ValueError(
+                "Cannot restore dataflow state: the saved state contains "
+                "{} unbatched datapoints, but the batch size is {}!".format(
+                    len(holder), self.batch_size))
+        self.ds.set_state(state['child'])
+        self._holder = list(holder)
+        # The child dataflow was restored to a new position: drop the old
+        # iterator so that a new one will be created on demand.
+        old_itr, self._itr = self._itr, None
+        close = getattr(old_itr, 'close', None)
+        if close is not None:
+            close()
 
     @staticmethod
     def _batch_numpy(data_list):
@@ -228,6 +282,14 @@ class BatchDataByShape(BatchData):
                     yield BatchData.aggregate_batch(holder)
                     del holder[:]
 
+    def get_state(self):
+        raise NotImplementedError(
+            "get_state() is not implemented in {}!".format(type(self).__name__))
+
+    def set_state(self, state):
+        raise NotImplementedError(
+            "set_state() is not implemented in {}!".format(type(self).__name__))
+
 
 class FixedSizeData(ProxyDataFlow):
     """ Generate data from another DataFlow, but with a fixed total count.
@@ -292,6 +354,8 @@ class MapData(ProxyDataFlow):
         1. Please make sure func doesn't modify its arguments in place,
            unless you're certain it's safe.
         2. If you discard some datapoints, ``len(MapData(ds))`` will be incorrect.
+        3. For :meth:`get_state`/:meth:`set_state` to be correct, func has to
+           be a deterministic pure function.
 
     Example:
 
@@ -316,6 +380,20 @@ class MapData(ProxyDataFlow):
             ret = self.func(copy(dp))  # shallow copy the list
             if ret is not None:
                 yield ret
+
+    def get_state(self):
+        # MapData itself is stateless (see the notes above): the state of the
+        # chain is fully determined by the input dataflow.
+        return {
+            'class': type(self).__name__,
+            'config': {},
+            'state': None,
+            'child': self.ds.get_state(),
+        }
+
+    def set_state(self, state):
+        self._check_state(state, {})
+        self.ds.set_state(state['child'])
 
 
 class MapDataComponent(MapData):
@@ -620,6 +698,11 @@ class LocallyShuffleData(ProxyDataFlow, RNGDataFlow):
         Datapoints from one pass of `ds` will get mixed with datapoints from a different pass.
         As a result, the iterator of this dataflow will run indefinitely
         because it does not make sense to stop the iteration anywhere.
+
+        This dataflow supports :meth:`get_state` and :meth:`set_state`:
+        the saved state contains the buffer, the shuffle RNG and the position
+        of the input dataflow, so a restored dataflow continues with exactly
+        the same stream of datapoints.
     """
 
     def __init__(self, ds, buffer_size, num_reuse=1, shuffle_interval=None):
@@ -641,6 +724,11 @@ class LocallyShuffleData(ProxyDataFlow, RNGDataFlow):
         self.shuffle_interval = shuffle_interval
         self.num_reuse = num_reuse
         self._inf_ds = RepeatedData(ds, -1)
+        self._iter_cnt = 0
+        # The datapoint that is currently being duplicated into the buffer,
+        # and the number of times it has been put into the buffer already.
+        self._current_dp = None
+        self._reuse_cnt = 0
 
     def reset_state(self):
         self._guard = DataFlowReentrantGuard()
@@ -648,21 +736,94 @@ class LocallyShuffleData(ProxyDataFlow, RNGDataFlow):
         RNGDataFlow.reset_state(self)
         self._iter_cnt = 0
         self._inf_iter = iter(self._inf_ds)
+        self._current_dp = None
+        self._reuse_cnt = 0
 
     def __len__(self):
         return len(self.ds) * self.num_reuse
 
     def __iter__(self):
         with self._guard:
-            for dp in self._inf_iter:
-                self._iter_cnt = (self._iter_cnt + 1) % self.shuffle_interval
-                # fill queue
-                if self._iter_cnt == 0:
-                    self.rng.shuffle(self.q)
-                for _ in range(self.num_reuse):
+            while True:
+                if self._current_dp is None:
+                    self._current_dp = next(self._inf_iter)
+                    self._reuse_cnt = 0
+                    self._iter_cnt = (self._iter_cnt + 1) % self.shuffle_interval
+                    # fill queue
+                    if self._iter_cnt == 0:
+                        self.rng.shuffle(self.q)
+                dp = self._current_dp
+                while self._reuse_cnt < self.num_reuse:
+                    self._reuse_cnt += 1
                     if self.q.maxlen == len(self.q):
-                        yield self.q.popleft()
-                    self.q.append(dp)
+                        ret = self.q.popleft()
+                        # update the buffer before yielding, so that the state
+                        # of this dataflow is well-defined whenever it is paused
+                        self.q.append(dp)
+                        yield ret
+                    else:
+                        self.q.append(dp)
+                self._current_dp = None
+
+    def get_state(self):
+        if self.rng is None:
+            raise RuntimeError(
+                "reset_state() must be called before get_state()!")
+        return {
+            'class': type(self).__name__,
+            'config': {
+                'buffer_size': self.q.maxlen,
+                'shuffle_interval': self.shuffle_interval,
+                'num_reuse': self.num_reuse,
+            },
+            'state': {
+                'rng': self.rng.get_state(),
+                'buffer': list(self.q),
+                'iter_cnt': self._iter_cnt,
+                'current_dp': self._current_dp,
+                'reuse_cnt': self._reuse_cnt,
+            },
+            'child': self.ds.get_state(),
+        }
+
+    def set_state(self, state):
+        self._check_state(state, {
+            'buffer_size': self.q.maxlen,
+            'shuffle_interval': self.shuffle_interval,
+            'num_reuse': self.num_reuse,
+        })
+        s = state['state']
+        buffer = s['buffer']
+        if len(buffer) > self.q.maxlen:
+            raise ValueError(
+                "Cannot restore dataflow state: the saved buffer has {} "
+                "datapoints, but the buffer size is {}!".format(
+                    len(buffer), self.q.maxlen))
+        iter_cnt = s['iter_cnt']
+        if not 0 <= iter_cnt < self.shuffle_interval:
+            raise ValueError(
+                "Cannot restore dataflow state: the saved shuffle counter {} "
+                "is out of range for shuffle interval {}!".format(
+                    iter_cnt, self.shuffle_interval))
+        reuse_cnt = s['reuse_cnt']
+        if not 0 <= reuse_cnt <= self.num_reuse:
+            raise ValueError(
+                "Cannot restore dataflow state: the saved reuse counter {} "
+                "is out of range for num_reuse {}!".format(
+                    reuse_cnt, self.num_reuse))
+        if not hasattr(self, '_guard'):
+            self._guard = DataFlowReentrantGuard()
+        if self.rng is None:
+            self.rng = np.random.RandomState()
+        self.rng.set_state(s['rng'])
+        self.q = deque(buffer, maxlen=self.q.maxlen)
+        self._iter_cnt = iter_cnt
+        self._current_dp = s['current_dp']
+        self._reuse_cnt = reuse_cnt
+        self.ds.set_state(state['child'])
+        # The child dataflow was restored to a new position: recreate the
+        # iterator so that no old position of the child is kept.
+        self._inf_iter = iter(self._inf_ds)
 
 
 class CacheData(ProxyDataFlow):

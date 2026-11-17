@@ -140,8 +140,84 @@ class DataFlow(object):
         * Tensorpack's built-in forking dataflows (:class:`MultiProcessRunner`, :class:`MultiProcessMapData`, etc)
           and other component that uses dataflows (:class:`InputSource`)
           already take care of the responsibility of calling this method.
+
+        * To save & restore the position of an interrupted job in the middle of the data,
+          see :meth:`get_state` and :meth:`set_state`. Note that :meth:`reset_state`
+          has to be called before :meth:`set_state`.
         """
         pass
+
+    def get_state(self):
+        """
+        Get a snapshot of the current state of this dataflow, so that the
+        dataflow can later be restored to this exact state (e.g. in a new
+        process) by :meth:`set_state`.
+
+        The returned object contains only plain data (python/numpy primitives
+        and datapoints) and is picklable: runtime objects such as locks and
+        iterators are never part of the state.
+
+        To resume from a saved state, create a new dataflow with the **same
+        data and the same options**, call :meth:`reset_state`, and then
+        :meth:`set_state` with the saved state. Afterwards the new dataflow
+        produces exactly the same stream of datapoints as the old one would
+        have produced after the state was saved.
+
+        Note:
+            1. :meth:`get_state` can be called at any time between two
+               iterations. To resume a training from batch boundaries, call
+               it right after a batch was produced by the dataflow.
+            2. Only certain dataflows implement this method. Currently they
+               are: :class:`DataFromList`, :class:`MapData`,
+               :class:`LocallyShuffleData` and :class:`BatchData`.
+
+        Returns:
+            object: the state of this dataflow.
+        """
+        raise NotImplementedError(
+            "get_state() is not implemented in {}!".format(type(self).__name__))
+
+    def set_state(self, state):
+        """
+        Restore the state of this dataflow from an object produced by
+        :meth:`get_state`.
+
+        It must be called after :meth:`reset_state` and before the iteration
+        starts. It validates that the state was saved by a dataflow with the
+        same data and the same options, and raises :class:`ValueError`
+        otherwise.
+
+        Args:
+            state (object): the return value of a previous :meth:`get_state` call.
+        """
+        raise NotImplementedError(
+            "set_state() is not implemented in {}!".format(type(self).__name__))
+
+    def _check_state(self, state, config):
+        """
+        Check that ``state`` is a state dict produced by :meth:`get_state` of
+        a dataflow with the same class and the same configuration as this one.
+
+        Args:
+            state (object): the object passed to :meth:`set_state`.
+            config (dict): the configuration of this dataflow instance, to be
+                compared against the configuration stored in ``state``.
+
+        Raises:
+            ValueError: if the state does not match this dataflow.
+        """
+        if not isinstance(state, dict) or state.get('class') != type(self).__name__:
+            raise ValueError(
+                "Cannot restore dataflow state: the state was created by '{}', "
+                "but this dataflow is a '{}'!".format(
+                    state.get('class') if isinstance(state, dict) else type(state).__name__,
+                    type(self).__name__))
+        saved_config = state.get('config')
+        if saved_config != config:
+            raise ValueError(
+                "Cannot restore dataflow state: the dataflow was created with "
+                "different data or options than the one that saved the state! "
+                "Saved config: {}. Current config: {}.".format(saved_config, config))
 
     # These are the old (overly verbose) names for the methods:
     def get_data(self):
