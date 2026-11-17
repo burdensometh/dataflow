@@ -42,6 +42,23 @@ for img, label in d:
   # ...
 ```
 
+### Splitting one source into several branches:
+`DataFlowSplitter` lets a single (possibly one-shot) DataFlow feed several
+independent consumers. The source is reset and iterated exactly once; every
+active branch sees all datapoints in the original order and can be wrapped on
+its own. A branch that falls behind gets its excess backlog spilled to a
+temporary file instead of using unbounded memory, and closing one branch
+releases its backlog without disturbing the others.
+
+```python
+splitter = D.DataFlowSplitter(one_shot_ds, buffer_size=1000)
+train = D.BatchData(D.MapData(splitter.branch('train'), train_map), 64)
+log = splitter.branch('log')        # e.g. consumed by a writer
+train.reset_state()
+for batch in train:
+  ...
+```
+
 ## Documentation:
 ### Tutorials:
 1. [Basics](https://tensorpack.readthedocs.io/tutorial/dataflow.html)
