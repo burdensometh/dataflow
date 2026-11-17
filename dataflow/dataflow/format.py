@@ -17,11 +17,46 @@ from .base import DataFlowReentrantGuard, RNGDataFlow
 from .common import MapData
 
 __all__ = ['HDF5Data', 'LMDBData', 'LMDBDataDecoder',
-           'CaffeLMDB', 'SVMLightData']
+           'CaffeLMDB', 'SVMLightData', 'IncompleteLMDBError']
 
 """
 Adapters for different data format.
 """
+
+# Reserved keys used by LMDBSerializer.  They are metadata, not datapoints.
+LMDB_META_KEY = b'__meta__'
+LMDB_KEYS_KEY = b'__keys__'
+LMDB_INTERNAL_KEYS = (LMDB_KEYS_KEY, LMDB_META_KEY)
+
+
+class IncompleteLMDBError(RuntimeError):
+    """
+    Raised when trying to read an LMDB export which has not been finished yet.
+    Such an export is only readable after ``LMDBSerializer.save_resume`` has
+    completed it.
+    """
+    pass
+
+
+def read_lmdb_meta(txn):
+    """
+    Read the ``__meta__`` entry of a LMDB transaction.
+
+    Args:
+        txn: a read transaction.
+
+    Returns:
+        dict or None: the metadata written by :meth:`LMDBSerializer.save_resume`,
+        or None if this is not a resumable export.
+    """
+    raw = txn.get(LMDB_META_KEY)
+    if raw is None:
+        return None
+    meta = loads(raw)
+    if not isinstance(meta, dict):
+        raise IncompleteLMDBError(
+            "Malformed LMDB metadata: expected a dict, got {}.".format(type(meta)))
+    return meta
 
 
 class HDF5Data(RNGDataFlow):
@@ -67,6 +102,10 @@ class LMDBData(RNGDataFlow):
     You might want to use
     :class:`LMDBDataDecoder` or apply a
     mapper function after :class:`LMDBData`.
+
+    Databases produced by :meth:`LMDBSerializer.save_resume` carry a
+    ``__meta__`` entry.  Reading one before it's finished raises
+    :class:`IncompleteLMDBError` instead of silently returning partial data.
     """
     def __init__(self, lmdb_path, shuffle=True, keys=None):
         """
@@ -81,17 +120,32 @@ class LMDBData(RNGDataFlow):
                 :func:`LMDBSerializer.save` used to store the list of keys.
                 If still not found, it will iterate over the database to find
                 all the keys.
+
+        Raises:
+            IncompleteLMDBError: if this is a resumable export that has not been
+                completed yet.
         """
         self._lmdb_path = lmdb_path
         self._shuffle = shuffle
 
         self._open_lmdb()
-        self._size = self._txn.stat()['entries']
-        self._set_keys(keys)
-        logger.info("Found {} entries in {}".format(self._size, self._lmdb_path))
+        try:
+            meta = read_lmdb_meta(self._txn)
+            if meta is not None and meta.get('status') != 'complete':
+                raise IncompleteLMDBError(
+                    "LMDB export {} is not complete: status={}, committed {} of {} datapoints. "
+                    "Finish it with LMDBSerializer.save_resume() before reading.".format(
+                        lmdb_path, meta.get('status'),
+                        meta.get('progress', 0), meta.get('size', 0)))
 
-        # Clean them up after finding the list of keys, since we don't want to fork them
-        self._close_lmdb()
+            self._size = self._txn.stat()['entries']
+            # Metadata entries are not datapoints.
+            self._size -= sum(1 for k in LMDB_INTERNAL_KEYS if self._txn.get(k) is not None)
+            self._set_keys(keys)
+            logger.info("Found {} entries in {}".format(self._size, self._lmdb_path))
+        finally:
+            # Clean them up after finding the list of keys, since we don't want to fork them
+            self._close_lmdb()
 
     def _set_keys(self, keys=None):
         def find_keys(txn, size):
@@ -99,16 +153,16 @@ class LMDBData(RNGDataFlow):
             keys = []
             with timed_operation("Loading LMDB keys ...", log_start=True), \
                     get_tqdm(total=size) as pbar:
-                for k in self._txn.cursor():
-                    assert k[0] != b'__keys__'
-                    keys.append(k[0])
+                for k, _ in self._txn.cursor():
+                    if k in LMDB_INTERNAL_KEYS:
+                        continue
+                    keys.append(k)
                     pbar.update()
             return keys
 
-        self.keys = self._txn.get(b'__keys__')
+        self.keys = self._txn.get(LMDB_KEYS_KEY)
         if self.keys is not None:
             self.keys = loads(self.keys)
-            self._size -= 1     # delete this item
 
         if self._shuffle:   # keys are necessary when shuffle is True
             if keys is None:
@@ -117,7 +171,7 @@ class LMDBData(RNGDataFlow):
             else:
                 # check if key-format like '{:0>8d}' was given
                 if isinstance(keys, six.string_types):
-                    self.keys = map(lambda x: keys.format(x), list(np.arange(self._size)))
+                    self.keys = [keys.format(x).encode('ascii') for x in range(self._size)]
                 else:
                     self.keys = keys
 
@@ -146,7 +200,7 @@ class LMDBData(RNGDataFlow):
             if not self._shuffle:
                 c = self._txn.cursor()
                 for k, v in c:
-                    if k != b'__keys__':
+                    if k not in LMDB_INTERNAL_KEYS:
                         yield [k, v]
             else:
                 self.rng.shuffle(self.keys)
